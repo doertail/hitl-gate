@@ -94,6 +94,8 @@ The decision lives in its own node on purpose. **When LangGraph resumes after `i
 
 If you wire graphs yourself, use `GateDecider(policy, mode, audit_rate, seed)` directly: it returns a plain dict you store in state, and `make_record(run_id, gate_id, decision, answer)` builds the log entry.
 
+**Seeding.** Audit sampling draws from one RNG per gate, seeded from `f"{seed}:{gate_id}"` (hashed with SHA-512, stable across processes, unlike Python's salted `hash()`). Passing the same `seed` to every gate is fine: each gate gets an independent, reproducible stream, and one `GateDecider` serving several gates behaves like one decider per gate.
+
 ## Policies
 
 | Policy | Asks when | Learns from |
@@ -102,6 +104,10 @@ If you wire graphs yourself, use `GateDecider(policy, mode, audit_rate, seed)` d
 | `NeverAsk` | never (baseline only) | — |
 | `RulePolicy.fit(records, keys, min_count=30, max_change_rate=0.02)` | the bucket `(gate_id, feature values)` has fewer than `min_count` reviewed samples **or** a miss rate above `max_change_rate`. Unknown buckets → ask. `describe()` prints the rules. | logged reviews |
 | `QTablePolicy` | `Q(ask) >= Q(auto)` for `(gate_id, discretized features)`. Ties and unseen states → ask. `act()` for epsilon-greedy training, `learn_episode()`, `save()`/`load()` JSON. | your reward signal (e.g. `-review_cost`, `-error_cost`) |
+
+`RulePolicy` buckets only use the `keys` a gate's features actually contain, so one `keys` list can span gates with different features, and `describe()` shows each gate's own conditions.
+
+**`QTablePolicy` learning rate.** `update()` and `learn_episode()` take `alpha` as a float (fixed rate), `"visit"` (`1/n` per `(state, action)`, i.e. Q is the running mean of its targets), or a callable `alpha(n)`. With rare, large costs (an error that slips through is much more expensive than a review) a fixed rate makes Q jump every time one of those costs lands; `"visit"` averages them out. For `1/n` with a floor, so the table keeps adapting later on, pass `alpha=lambda n: max(1 / n, 0.001)`. Visit counts live in `policy.n` and are saved by `save()`; files from 0.1.0 load with empty counts.
 
 Any object with `name: str` and `decide(gate_id, features) -> (ask: bool, reason: str)` is a policy.
 
@@ -117,7 +123,9 @@ A review that says "approve" is not proof that the item was fine. `RulePolicy` c
 
 ## Logging format
 
-One `DecisionRecord` per gate decision (JSONL when `DecisionLog(path)` is given):
+One `DecisionRecord` per gate decision (JSONL when `DecisionLog(path)` is given).
+
+The file is **append-only**: `append` writes one record line and `mark_downstream` writes one small patch line, `{"_patch": {"run_id", "gate_id", "downstream_error"}}`, so marking stays O(1) however large the log is. `DecisionLog.from_jsonl(path)` replays the patches (and reads 0.1.0 files unchanged). Call `log.compact()` to rewrite the file once with patches merged. `DecisionLog(path)` appends to an existing file; it does not load or truncate it.
 
 | field | meaning |
 |---|---|
@@ -130,7 +138,9 @@ One `DecisionRecord` per gate decision (JSONL when `DecisionLog(path)` is given)
 | `changed` | `human_outcome != "approve"` |
 | `review_seconds` | from the answer |
 | `downstream_error` | filled later via `mark_downstream` |
-| `ts` | unix time |
+| `ts` | unix time, stamped by the log's `clock` on `append` |
+
+For byte-reproducible logs, pass a fixed clock: `DecisionLog(path, clock=lambda: 0.0)`. Together with a fixed `seed`, two runs then write identical files.
 
 Auto passes are logged by the gate node. Asked items are logged once the human answers, so a review that never comes back leaves no record.
 
@@ -139,7 +149,7 @@ Auto passes are logged by the gate node. Asked items are logged once the human a
 - **Simulated results depend on their assumptions.** The plot comes from a toy pipeline with made-up error rates, catch rate (90%) and costs (1 review = 1, 1 missed error = 25). Your numbers will differ. Run shadow mode on your own traffic first.
 - **Never gate legally or contractually required approvals.** If a human must sign off, keep `interrupt()` unconditional.
 - **Features must be discrete.** Buckets and Q-tables need a handful of values per feature. Bucket continuous signals in `featurize` (or use `QTablePolicy(bins=...)`). Too many features means too few samples per bucket, so everything stays "ask", which is the safe failure mode.
-- **Tabular RL is simple by design.** `QTablePolicy` is a transparent baseline, not a state-of-the-art learner. In the example it trains on a fast pure-Python mirror of the simulation and does not beat the rule policy.
+- **Tabular RL is simple by design.** `QTablePolicy` is a transparent baseline, not a state-of-the-art learner. In the example it trains on a fast pure-Python mirror of the simulation (fixed `alpha=0.02`) and does not beat the rule policy.
 - `retry` and `escalate` are logged, but routing stays `review -> target`. For retry loops, wire your own edges using `GateDecider`.
 
 ## Related work
@@ -156,7 +166,7 @@ python3 -m venv .venv            # tested with Python 3.14 and langgraph 1.2
 .venv/bin/python examples/document_pipeline/run.py   # ~25 s, writes docs/tradeoff.png
 ```
 
-The example is seeded and reproducible.
+The example is seeded and reproducible. See [CHANGELOG.md](CHANGELOG.md) for changes between versions.
 
 ## License
 

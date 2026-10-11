@@ -94,6 +94,8 @@ flowchart LR
 
 그래프를 직접 연결한다면 `GateDecider(policy, mode, audit_rate, seed)`를 바로 쓰세요. state에 저장할 수 있는 평범한 dict를 반환하고, `make_record(run_id, gate_id, decision, answer)`가 로그 항목을 만듭니다.
 
+**시드.** audit 샘플링은 게이트마다 따로 둔 난수 생성기를 쓰며, 시드는 `f"{seed}:{gate_id}"`에서 만듭니다(SHA-512 해시라 파이썬의 솔트된 `hash()`와 달리 프로세스가 바뀌어도 같음). 모든 게이트에 같은 `seed`를 줘도 됩니다. 게이트마다 독립적이고 재현 가능한 난수열을 받고, `GateDecider` 하나가 여러 게이트를 맡아도 게이트별 decider를 따로 둔 것과 같게 동작합니다.
+
 ## 정책
 
 | 정책 | 물어보는 경우 | 학습 원천 |
@@ -102,6 +104,10 @@ flowchart LR
 | `NeverAsk` | 절대 안 물음 (베이스라인 전용) | — |
 | `RulePolicy.fit(records, keys, min_count=30, max_change_rate=0.02)` | 버킷 `(gate_id, 피처 값)`의 검토 샘플이 `min_count` 미만이거나 **또는** miss 비율이 `max_change_rate`를 넘을 때. 모르는 버킷 → ask. `describe()`가 규칙을 출력. | 기록된 검토 |
 | `QTablePolicy` | `(gate_id, 이산화된 피처)`에서 `Q(ask) >= Q(auto)`일 때. 동점과 처음 보는 상태 → ask. 학습용 epsilon-greedy `act()`, `learn_episode()`, JSON `save()`/`load()`. | 직접 정의한 보상 (예: `-review_cost`, `-error_cost`) |
+
+`RulePolicy` 버킷은 `keys` 중 그 게이트의 피처에 실제로 있는 키만 씁니다. 그래서 피처가 서로 다른 게이트들이 `keys` 목록 하나를 같이 써도 되고, `describe()`는 게이트마다 자기 조건만 보여 줍니다.
+
+**`QTablePolicy` 학습률.** `update()`와 `learn_episode()`의 `alpha`는 실수(고정 학습률), `"visit"`(`(상태, 행동)`별 `1/n`, 즉 Q가 목표값의 누적 평균), 또는 호출 가능 객체 `alpha(n)`을 받습니다. 드물지만 큰 비용(놓친 오류가 검토보다 훨씬 비쌈)이 있으면 고정 학습률에서는 그런 비용이 들어올 때마다 Q가 크게 출렁이는데, `"visit"`는 이를 평균으로 흡수합니다. 나중에도 계속 적응하도록 하한을 둔 `1/n`이 필요하면 `alpha=lambda n: max(1 / n, 0.001)`을 넘기세요. 방문 횟수는 `policy.n`에 있고 `save()`가 함께 저장합니다. 0.1.0에서 저장한 파일은 빈 방문 횟수로 불러옵니다.
 
 `name: str`과 `decide(gate_id, features) -> (ask: bool, reason: str)`를 가진 객체는 무엇이든 정책이 될 수 있습니다.
 
@@ -117,7 +123,9 @@ flowchart LR
 
 ## 로그 형식
 
-게이트 결정 하나당 `DecisionRecord` 하나 (`DecisionLog(path)`를 주면 JSONL로도 저장):
+게이트 결정 하나당 `DecisionRecord` 하나 (`DecisionLog(path)`를 주면 JSONL로도 저장).
+
+파일은 **추가 전용(append-only)** 입니다. `append`는 레코드 한 줄을, `mark_downstream`은 작은 패치 한 줄 `{"_patch": {"run_id", "gate_id", "downstream_error"}}`을 덧붙이므로, 로그가 아무리 커도 표시 비용은 O(1)입니다. `DecisionLog.from_jsonl(path)`가 패치를 재생해 읽고(0.1.0 파일도 그대로 읽음), `log.compact()`는 패치를 합쳐 파일을 한 번 다시 씁니다. `DecisionLog(path)`는 기존 파일에 이어 쓰며, 불러오거나 비우지 않습니다.
 
 | 필드 | 의미 |
 |---|---|
@@ -130,7 +138,9 @@ flowchart LR
 | `changed` | `human_outcome != "approve"` |
 | `review_seconds` | 답에서 가져옴 |
 | `downstream_error` | 나중에 `mark_downstream`으로 채움 |
-| `ts` | 유닉스 시간 |
+| `ts` | 유닉스 시간. `append` 때 로그의 `clock`이 찍음 |
+
+바이트 단위로 재현 가능한 로그가 필요하면 고정 시계를 넘기세요: `DecisionLog(path, clock=lambda: 0.0)`. 고정 `seed`와 함께 쓰면 두 번 실행해도 같은 파일이 나옵니다.
 
 auto 통과는 gate 노드가 기록합니다. 물어본 항목은 사람이 답한 뒤에 기록되므로, 답이 오지 않은 검토는 기록이 남지 않습니다.
 
@@ -139,7 +149,7 @@ auto 통과는 gate 노드가 기록합니다. 물어본 항목은 사람이 답
 - **시뮬레이션 결과는 가정에 좌우됩니다.** 그래프는 임의로 정한 오류율, 적발률(90%), 비용(검토 1회 = 1, 놓친 오류 1건 = 25)을 쓰는 장난감 파이프라인에서 나왔습니다. 여러분의 수치는 다를 것입니다. 먼저 실제 트래픽에서 shadow 모드로 돌려 보세요.
 - **법적·계약상 필수인 승인은 절대 게이트하지 마세요.** 사람이 반드시 서명해야 한다면 `interrupt()`를 무조건 유지하세요.
 - **피처는 이산적이어야 합니다.** 버킷과 Q-table은 피처당 몇 개의 값만 다룰 수 있습니다. 연속 신호는 `featurize`에서 구간화하세요(또는 `QTablePolicy(bins=...)`). 피처가 너무 많으면 버킷당 샘플이 부족해 모든 것이 "ask"로 남는데, 이는 안전한 방향의 실패입니다.
-- **테이블 RL은 의도적으로 단순합니다.** `QTablePolicy`는 투명한 베이스라인이지 최신 학습기가 아닙니다. 예제에서는 시뮬레이션을 순수 파이썬으로 옮긴 빠른 미러에서 학습하며, 규칙 정책을 이기지 못합니다.
+- **테이블 RL은 의도적으로 단순합니다.** `QTablePolicy`는 투명한 베이스라인이지 최신 학습기가 아닙니다. 예제에서는 시뮬레이션을 순수 파이썬으로 옮긴 빠른 미러에서 학습하며(고정 `alpha=0.02`), 규칙 정책을 이기지 못합니다.
 - `retry`와 `escalate`는 기록되지만 라우팅은 `review -> target`으로 고정입니다. 재시도 루프가 필요하면 `GateDecider`로 엣지를 직접 연결하세요.
 
 ## 관련 연구
@@ -156,7 +166,7 @@ python3 -m venv .venv            # Python 3.14, langgraph 1.2에서 테스트됨
 .venv/bin/python examples/document_pipeline/run.py   # 약 25초, docs/tradeoff.png 생성
 ```
 
-예제는 시드가 고정되어 있어 재현 가능합니다.
+예제는 시드가 고정되어 있어 재현 가능합니다. 버전별 변경 사항은 [CHANGELOG.md](CHANGELOG.md) 참조.
 
 ## 라이선스
 

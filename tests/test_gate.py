@@ -190,3 +190,124 @@ def test_qtable_learns_and_roundtrips(tmp_path):
     q.save(tmp_path / "q.json")
     q2 = QTablePolicy.load(tmp_path / "q.json")
     assert q2.q == q.q and q2.decide("g", {"score": 0.2}) == q.decide("g", {"score": 0.2})
+
+
+# ---------------------------------------------------------------- 0.1.1 regressions
+
+
+def test_audit_rng_is_per_gate_and_reproducible():
+    def picks(gate, seed=7):
+        d = GateDecider(NeverAsk(), audit_rate=0.5, seed=seed)
+        return [d(gate, {})["ask"] for _ in range(2000)]
+
+    a, b = picks("g1"), picks("g2")
+    assert a == picks("g1")  # same seed + gate_id reproduces
+    assert a != b
+    agree = sum(x == y for x, y in zip(a, b)) / len(a)
+    assert 0.45 < agree < 0.55  # independent coins at p=0.5 agree ~50% of the time
+    # one decider serving several gates gives each gate its own stream, same as separate deciders
+    shared = GateDecider(NeverAsk(), audit_rate=0.5, seed=7)
+    mixed = [(shared("g1", {})["ask"], shared("g2", {})["ask"]) for _ in range(2000)]
+    assert [x for x, _ in mixed] == a and [y for _, y in mixed] == b
+
+
+def test_audit_picks_independent_across_gates_in_graph():
+    log = DecisionLog()
+    b = StateGraph(State)
+    b.add_node("work", lambda s: {"value": "draft"})
+    b.add_node("mid", lambda s: {})
+    b.add_edge(START, "work")
+    common = dict(policy=NeverAsk(), featurize=lambda s: {}, make_review_payload=lambda s: {},
+                  apply_answer=lambda s, a: {}, log=log, audit_rate=0.5, seed=3)
+    add_gated_review(b, "g1", source="work", target="mid", **common)
+    add_gated_review(b, "g2", source="mid", target=END, **common)
+    g = b.compile(checkpointer=MemorySaver())
+    for i in range(200):
+        run_episode(g, {"run_id": str(i)}, approve, f"t{i}")
+    audited = {gid: [r.run_id for r in log.filter(gid) if r.mode == "audit"] for gid in ("g1", "g2")}
+    assert audited["g1"] != audited["g2"]
+
+
+def test_mark_downstream_is_append_only(tmp_path):
+    path = tmp_path / "log.jsonl"
+    log = DecisionLog(path)
+    for i in range(50):
+        for gate in ("g", "h"):
+            log.append(DecisionRecord(f"r{i}", gate, {}, "auto", "p", ""))
+    size = len(path.read_bytes().splitlines())
+    for i in range(50):
+        before = path.read_bytes()
+        assert log.mark_downstream(f"r{i}", "g", i % 3 == 0) == 1
+        after = path.read_bytes()
+        assert after.startswith(before) and len(after.splitlines()) == len(before.splitlines()) + 1
+    assert log.mark_downstream("nope", "g", True) == 0
+    assert len(path.read_bytes().splitlines()) == size + 50
+    log.mark_downstream("r0", "g", False)  # later patches win
+    expected = [r.downstream_error for r in log.records]
+    loaded = DecisionLog.from_jsonl(path)
+    assert [r.downstream_error for r in loaded.records] == expected
+    assert expected[0] is False and expected[6] is True and expected[1] is None
+    log.compact()
+    lines = path.read_text().splitlines()
+    assert len(lines) == 100 and not any("_patch" in ln for ln in lines)
+    assert [r.downstream_error for r in DecisionLog.from_jsonl(path).records] == expected
+
+
+def test_qtable_visit_alpha_is_running_mean(tmp_path):
+    rng = random.Random(0)
+    q = QTablePolicy()
+    targets = [rng.choice([-1.0, -1.0, -1.0, -500.0]) for _ in range(1000)]
+    for t in targets:
+        q.learn_episode([("g", {"x": 1}, "auto", t, None, None)], alpha="visit")
+    key = q.key("g", {"x": 1})
+    assert q.q[key]["auto"] == pytest.approx(sum(targets) / len(targets), rel=1e-12)
+    assert q.n[key] == {"ask": 0, "auto": 1000}
+    q.save(tmp_path / "q.json")
+    q2 = QTablePolicy.load(tmp_path / "q.json")
+    assert q2.n == q.n and q2.q == q.q
+    # callable schedule: 1/n with a floor; a float keeps the old fixed-rate behaviour
+    qc, qf = QTablePolicy(), QTablePolicy()
+    for t in targets:
+        qc.update("k", "ask", t, alpha=lambda n: max(1 / n, 0.01))
+        qf.update("k", "ask", t, alpha=0.01)
+    assert qc.q["k"]["ask"] != qf.q["k"]["ask"] and qc.n["k"]["ask"] == 1000
+    with pytest.raises(ValueError):
+        q.update("k", "ask", 0.0, alpha="fast")
+
+
+def test_qtable_loads_files_without_counts(tmp_path):
+    import json
+
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps({"name": "qtable", "keys": None, "bins": {}, "q": {"k": {"ask": -1.0, "auto": 0.0}}}))
+    q = QTablePolicy.load(path)
+    assert q.n == {} and q.decide("x", {})[0] is True
+    q.update("k", "ask", -3.0, alpha="visit")  # first visit after load: alpha = 1
+    assert q.q["k"]["ask"] == -3.0
+
+
+def test_fixed_clock_gives_byte_identical_jsonl(tmp_path):
+    def run(path):
+        log = DecisionLog(path, clock=lambda: 1700000000.0)
+        g = build(NeverAsk(), log, audit_rate=0.3, seed=11)
+        for i in range(30):
+            run_episode(g, {"run_id": f"r{i}", "risky": False}, approve, f"t{i}")
+            log.mark_downstream(f"r{i}", "check", i % 4 == 0)
+        return path.read_bytes()
+
+    a, b = run(tmp_path / "a.jsonl"), run(tmp_path / "b.jsonl")
+    assert a == b and b'"ts": 1700000000.0' in a
+    rec = DecisionRecord("r", "g", {}, "ask", "p", "")
+    assert rec.ts is None
+    DecisionLog().append(rec)
+    assert isinstance(rec.ts, float)  # default clock is time.time
+
+
+def test_rule_describe_omits_features_a_gate_does_not_use():
+    recs = _recs(40, gate="a", feats={"x": 1}) + _recs(40, gate="b", feats={"y": "z", "w": None})
+    p = RulePolicy.fit(recs, min_count=30)
+    text = p.describe()
+    assert "y=None" not in text and "x=None" not in text
+    assert "[a] x=1  " in text and "[b] w=None, y='z'" in text  # explicit None values are kept
+    assert p.decide("a", {"x": 1})[0] is False and p.decide("b", {"y": "z", "w": None})[0] is False
+    assert text.splitlines()[-1].startswith("ask   anything else")

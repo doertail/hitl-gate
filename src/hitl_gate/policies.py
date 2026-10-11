@@ -7,7 +7,7 @@ import json
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable, Protocol, runtime_checkable
+from typing import Callable, Iterable, Literal, Protocol, Union, runtime_checkable
 
 from .log import DecisionRecord
 
@@ -40,13 +40,15 @@ class NeverAsk:
 
 
 def _bucket(gate_id: str, features: dict, keys: Iterable[str]) -> tuple:
-    return (gate_id, tuple((k, features.get(k)) for k in keys))
+    # keys a gate doesn't produce are left out (not stored as None), so per-gate rules stay readable
+    return (gate_id, tuple((k, features[k]) for k in keys if k in features))
 
 
 class RulePolicy:
     """Evidence-based allow-list: auto only for buckets humans demonstrably never needed to fix.
 
-    Build with :meth:`fit`. A bucket is ``(gate_id, values of the selected feature keys)``;
+    Build with :meth:`fit`. A bucket is ``(gate_id, values of the selected feature keys
+    that this item's features contain)``, so gates with different feature sets can share ``keys``;
     feature values must be hashable and discrete (bucketize continuous values in ``featurize``).
     Anything unseen or under-sampled is asked.
     """
@@ -111,10 +113,13 @@ class RulePolicy:
         lines = []
         for (gate_id, kv), (n, m) in sorted(self.stats.items(), key=lambda x: repr(x[0])):
             cond = ", ".join(f"{k}={v!r}" for k, v in kv) or "*"
-            verdict = "AUTO" if self._is_auto(n, m) else "ask "
-            lines.append(f"{verdict}  [{gate_id}] {cond}  (n={n}, misses={m}, rate={m / n:.1%})")
-        lines.append("ask   anything else")
+            verdict = "AUTO" if self._is_auto(n, m) else "ask"
+            lines.append(f"{verdict:<4}  [{gate_id}] {cond}  (n={n}, misses={m}, rate={m / n:.1%})")
+        lines.append(f"{'ask':<4}  anything else (unseen, or n < {self.min_count})")
         return "\n".join(lines)
+
+
+Alpha = Union[float, Literal["visit"], Callable[[int], float]]
 
 
 class QTablePolicy:
@@ -126,6 +131,16 @@ class QTablePolicy:
 
     ``bins`` maps a feature name to sorted cut points; that feature is replaced by
     its bin index. Other features are used as-is and must be JSON-serializable.
+
+    ``update`` / ``learn_episode`` take ``alpha`` (learning rate) as:
+
+    * a float: fixed rate (the 0.1.0 behaviour);
+    * ``"visit"``: ``1/n`` where ``n`` counts updates of that ``(state, action)``,
+      so Q is the running mean of its targets. Robust to rare, large costs;
+    * a callable ``alpha(n) -> float``, e.g. ``lambda n: max(1 / n, 0.001)`` for
+      ``1/n`` with a floor (keeps adapting once ``n`` is large).
+
+    Visit counts (``self.n``) are tracked for every update and saved with the table.
     """
 
     ACTIONS = ("ask", "auto")
@@ -135,6 +150,7 @@ class QTablePolicy:
         self.bins = bins or {}
         self.name = name
         self.q: dict[str, dict[str, float]] = {}
+        self.n: dict[str, dict[str, int]] = {}  # visit counts per (key, action)
 
     def key(self, gate_id: str, features: dict) -> str:
         keys = self.keys if self.keys is not None else sorted(features)
@@ -160,11 +176,22 @@ class QTablePolicy:
             return rng.random() < 0.5
         return self.decide(gate_id, features)[0]
 
-    def update(self, key: str, action: str, target: float, alpha: float = 0.1) -> None:
+    def update(self, key: str, action: str, target: float, alpha: Alpha = 0.1) -> None:
         q = self._q(key)
-        q[action] += alpha * (target - q[action])
+        counts = self.n.setdefault(key, {"ask": 0, "auto": 0})
+        counts[action] += 1
+        n = counts[action]
+        if alpha == "visit":
+            a = 1.0 / n
+        elif callable(alpha):
+            a = alpha(n)
+        elif isinstance(alpha, (int, float)):
+            a = alpha
+        else:
+            raise ValueError(f"alpha must be a float, 'visit' or a callable, got {alpha!r}")
+        q[action] += a * (target - q[action])
 
-    def learn_episode(self, transitions: list[tuple], alpha: float = 0.1, gamma: float = 1.0) -> None:
+    def learn_episode(self, transitions: list[tuple], alpha: Alpha = 0.1, gamma: float = 1.0) -> None:
         """One Q-learning pass over an episode.
 
         Each transition is ``(gate_id, features, action, reward, next_gate_id, next_features)``
@@ -180,7 +207,7 @@ class QTablePolicy:
             self.update(self.key(gate_id, feats), action, target, alpha)
 
     def save(self, path: str | Path) -> None:
-        data = {"name": self.name, "keys": self.keys, "bins": self.bins, "q": self.q}
+        data = {"name": self.name, "keys": self.keys, "bins": self.bins, "q": self.q, "n": self.n}
         Path(path).write_text(json.dumps(data, indent=1), encoding="utf-8")
 
     @classmethod
@@ -188,4 +215,5 @@ class QTablePolicy:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         p = cls(keys=data["keys"], bins=data["bins"], name=data["name"])
         p.q = data["q"]
+        p.n = data.get("n", {})  # files from 0.1.0 have no counts
         return p

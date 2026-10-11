@@ -38,6 +38,11 @@ class GateDecider:
          "reason": str, "policy_name": str, "features": dict}
 
     ``ask`` is whether a human will review; ``decision`` is what the policy said.
+
+    Audit sampling uses one RNG per ``gate_id``, seeded from ``f"{seed}:{gate_id}"``
+    (string seeds are hashed with SHA-512, so this is stable across processes).
+    Gates sharing a ``seed`` therefore get independent, reproducible audit picks.
+    ``seed=None`` seeds each gate's RNG from OS entropy.
     """
 
     def __init__(self, policy: Policy, mode: Literal["live", "shadow"] = "live", audit_rate: float = 0.0, seed: int | None = None):
@@ -48,7 +53,14 @@ class GateDecider:
         self.policy = policy
         self.mode = mode
         self.audit_rate = audit_rate
-        self.rng = random.Random(seed)
+        self.seed = seed
+        self._rngs: dict[str, random.Random] = {}
+
+    def rng(self, gate_id: str) -> random.Random:
+        """The audit RNG for ``gate_id`` (created on first use)."""
+        if gate_id not in self._rngs:
+            self._rngs[gate_id] = random.Random(None if self.seed is None else f"{self.seed}:{gate_id}")
+        return self._rngs[gate_id]
 
     def __call__(self, gate_id: str, features: dict) -> dict:
         ask, reason = self.policy.decide(gate_id, features)
@@ -57,7 +69,7 @@ class GateDecider:
         if mode == "shadow":
             will_ask = True
             reason = f"shadow (policy would {'ask' if ask else 'auto'}): {reason}"
-        elif not ask and self.audit_rate and self.rng.random() < self.audit_rate:
+        elif not ask and self.audit_rate and self.rng(gate_id).random() < self.audit_rate:
             will_ask, mode = True, "audit"
             reason = f"audit sample: {reason}"
         return {
@@ -119,6 +131,7 @@ def add_gated_review(
 
     Your state must include :class:`HITLState`'s keys and the graph must be compiled
     with a checkpointer. Do not add your own edge out of ``source``.
+    ``seed`` seeds this gate's audit RNG from ``(seed, gate_id)``, so several gates may share one seed.
     Returns the :class:`GateDecider` (handy for swapping ``.policy`` later).
     """
     decider = GateDecider(policy, mode=mode, audit_rate=audit_rate, seed=seed)
