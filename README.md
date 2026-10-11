@@ -72,6 +72,50 @@ graph.invoke(Command(resume={"outcome": "approve", "review_seconds": 12.0}), con
 
 `hitl_gate.sim.run_episode(graph, inputs, reviewer, thread_id)` does the invoke / interrupt / resume loop for you with a scripted reviewer, which is handy for tests and simulations.
 
+## Tool-call approval
+
+Most real HITL in agents is approving **tool calls** ("send_email", "issue_refund"). Wrap the risky tools with `gated_tool`: per call, the policy says ask (interrupt for approve / edit / reject / respond) or auto (the tool just runs). Untouched tools are never gated.
+
+```python
+from langgraph.prebuilt import ToolNode
+from hitl_gate import AlwaysAsk, DecisionLog, RulePolicy, gated_tool
+
+log = DecisionLog("tool_decisions.jsonl")
+refund = gated_tool(
+    issue_refund, policy=AlwaysAsk(), log=log,               # gate_id defaults to the tool name
+    featurize=lambda name, args: {"big": args["amount"] > 50},
+)
+tools = ToolNode([lookup_order, refund])                     # or create_agent(model, tools=[lookup_order, refund], checkpointer=...)
+
+# interrupt value (LangChain HITLRequest shape): {"action_requests": [{"name", "args", "description"}], "review_configs": [...], "hitl_gate": {...}}
+graph.invoke(Command(resume={"decisions": [{"type": "approve"}]}), config)
+#   {"type": "edit", "edited_action": {"name": "issue_refund", "args": {"amount": 20}}} | {"type": "reject", "message": "..."} | {"type": "respond", "message": "..."}
+
+refund.gate.policy = RulePolicy.fit(log.records, keys=["big"])  # small refunds auto, big ones still asked
+log.mark_downstream(tool_message.tool_call_id, "issue_refund", True)  # a refund that later went wrong
+```
+
+With LangChain's `create_agent`, you can instead swap the official middleware for a gated one. It keeps the official request/response format and batching, so existing approval UIs (e.g. Agent Inbox-style) keep working:
+
+```python
+from hitl_gate.middleware import GatedHumanInTheLoopMiddleware   # pip install "hitl-gate[langchain]"
+
+agent = create_agent(model, tools, checkpointer=MemorySaver(), middleware=[
+    GatedHumanInTheLoopMiddleware({"issue_refund": True, "send_email": True}, policy=policy, log=log, featurize=featurize),
+])
+```
+
+| Integration | Needs | Tested with |
+|---|---|---|
+| `gated_tool(...)` in `ToolNode`, a hand-built ReAct graph, or `create_agent(tools=...)` | core only (`langgraph`, which brings `langchain-core`) | langgraph 1.2.14, langgraph-prebuilt 1.1.0, langchain-core 1.6.9 |
+| `GatedHumanInTheLoopMiddleware` for `create_agent` | `hitl-gate[langchain]` (`langchain>=1.4`, which added `InterruptOnConfig.when`) | langchain 1.4.4 |
+
+Sync and async (`ainvoke`) are both tested. `run_id` in the log is the **tool call id** (also `ToolMessage.tool_call_id`) and `gate_id` is the tool name, so `mark_downstream(tool_call_id, tool_name, error)` labels one call. `human_outcome` adds `"reject"` and `"respond"` for tool calls. Each decision may carry `"review_seconds"`.
+
+**Determinism on resume.** There is no separate gate node here: on resume LangGraph re-runs the tool (or the middleware's `after_model`) from the top. The decision is cached in memory per `(thread_id, gate_id, tool_call_id)` until it is logged, and audit sampling is a stable hash of `(seed, gate_id, thread_id:tool_call_id)` (`GateDecider(..., key=...)`), not the next draw of a stream. A resumed call therefore reaches the same decision and logs exactly one record, even after a process restart if `seed` is set and the policy is deterministic. The tests check this.
+
+[`examples/tool_approval`](examples/tool_approval/run.py) runs a support agent offline (scripted model, simulated reviewer, ~3 s): after 200 always-ask conversations a fitted `RulePolicy` auto-approves refunds ≤ 50 (131 of 137 in the next 200, 6 audited) while larger refunds and every email still go to a human.
+
 ## How it works
 
 ```mermaid
@@ -134,7 +178,7 @@ The file is **append-only**: `append` writes one record line and `mark_downstrea
 | `decision` | what the **policy** decided: `"ask"` / `"auto"` |
 | `policy_name`, `reason` | which policy, and why |
 | `mode` | `"live"`, `"shadow"` (always asked) or `"audit"` (auto, sampled for review) |
-| `human_outcome` | `"approve"`, `"edit"`, `"retry"`, `"escalate"`, or `None` if nobody was asked |
+| `human_outcome` | `"approve"`, `"edit"`, `"retry"`, `"escalate"` (review gates), `"reject"`, `"respond"` (tool calls), or `None` if nobody was asked |
 | `changed` | `human_outcome != "approve"` |
 | `review_seconds` | from the answer |
 | `downstream_error` | filled later via `mark_downstream` |
@@ -151,6 +195,10 @@ Auto passes are logged by the gate node. Asked items are logged once the human a
 - **Features must be discrete.** Buckets and Q-tables need a handful of values per feature. Bucket continuous signals in `featurize` (or use `QTablePolicy(bins=...)`). Too many features means too few samples per bucket, so everything stays "ask", which is the safe failure mode.
 - **Tabular RL is simple by design.** `QTablePolicy` is a transparent baseline, not a state-of-the-art learner. In the example it trains on a fast pure-Python mirror of the simulation (fixed `alpha=0.02`) and does not beat the rule policy.
 - `retry` and `escalate` are logged, but routing stays `review -> target`. For retry loops, wire your own edges using `GateDecider`.
+- **Tool calls: parallel gated calls need one task per call.** `create_agent` and `create_react_agent` already dispatch each call with `Send`. A plain `ToolNode` that receives several gated calls in one message runs them in threads inside one task, where interrupts are matched by order, which is racy. Use `Send`, or the middleware (one batched interrupt).
+- **Tool calls: `gated_tool` cannot redirect an edit to another tool** (the middleware can). A gated tool must be invoked with a `ToolCall`, as `ToolNode` does, not with plain args.
+- **Tool calls: the decision cache is in-process.** After a restart a pending call's decision is recomputed: stable for deterministic policies with a `seed`, not for random or swapped policies. A call interrupted and never resumed stays in the cache. A tool that itself calls `interrupt()` would be logged twice.
+- **Logs are in-memory or a local JSONL file.** No database backend, no cross-process locking; several workers appending to one file is unsupported.
 
 ## Related work
 
@@ -160,10 +208,11 @@ Auto passes are logged by the gate node. Asked items are logged once the human a
 ## Development
 
 ```bash
-python3 -m venv .venv            # tested with Python 3.14 and langgraph 1.2
+python3 -m venv .venv            # tested with Python 3.14, langgraph 1.2.14, langchain 1.4.4
 .venv/bin/pip install -e ".[dev,examples]"
 .venv/bin/pytest -q
 .venv/bin/python examples/document_pipeline/run.py   # ~25 s, writes docs/tradeoff.png
+.venv/bin/python examples/tool_approval/run.py       # ~3 s, tool-call approval
 ```
 
 The example is seeded and reproducible. See [CHANGELOG.md](CHANGELOG.md) for changes between versions.

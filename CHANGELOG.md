@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0
+
+- **Tool-call approval.** New `gated_tool(tool, *, policy, log, gate_id=None, featurize=lambda name, args: {}, mode="live", audit_rate=0.0, seed=None, allowed_decisions=..., edit_notice=...)` wraps any LangChain tool so each call is gated: auto runs it, ask interrupts with a LangChain `HITLRequest`-shaped payload and accepts `{"decisions": [approve | edit | reject | respond]}`. Works in `ToolNode`, hand-built graphs and `create_agent`, with only `langgraph` installed. Sync and async.
+- **`GatedHumanInTheLoopMiddleware`** (`hitl_gate.middleware`, extra `hitl-gate[langchain]`, langchain>=1.4): the official `HumanInTheLoopMiddleware` with the policy as its `when` predicate, logging one record per gated call.
+- **Stable decisions on resume.** Tool-call decisions are cached per `(thread_id, gate_id, tool_call_id)` until logged, and audit draws can be keyed: `GateDecider.__call__(gate_id, features, key=None)` draws from `(seed, gate_id, key)` when `key` and `seed` are given. Existing calls without `key` behave as before.
+- `OUTCOMES` gains `"reject"` and `"respond"`. For tool calls, `run_id` is the tool call id and `gate_id` defaults to the tool name.
+- New example `examples/tool_approval` (offline support agent).
+
 ## 0.1.1
 
 - **Per-gate audit RNG.** `GateDecider` / `add_gated_review` now derive one RNG per gate from `f"{seed}:{gate_id}"`. Before, gates sharing a `seed` drew identical audit sequences, so audits hit the same runs at every gate. Audit picks for a given seed differ from 0.1.0. `GateDecider.rng` is now a method, `rng(gate_id)`.

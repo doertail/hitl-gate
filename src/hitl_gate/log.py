@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Literal
 
-OUTCOMES = ("approve", "edit", "retry", "escalate")
+OUTCOMES = ("approve", "edit", "retry", "escalate", "reject", "respond")  # last two: tool-call approval
 
 
 @dataclass
@@ -27,7 +27,7 @@ class DecisionRecord:
     policy_name: str
     reason: str
     mode: Literal["live", "shadow", "audit"] = "live"
-    human_outcome: str | None = None  # "approve" | "edit" | "retry" | "escalate" | None
+    human_outcome: str | None = None  # one of OUTCOMES, or None if nobody was asked
     changed: bool | None = None  # human changed the result (outcome != "approve")
     review_seconds: float | None = None
     downstream_error: bool | None = None  # filled later via DecisionLog.mark_downstream

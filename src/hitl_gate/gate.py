@@ -43,6 +43,11 @@ class GateDecider:
     (string seeds are hashed with SHA-512, so this is stable across processes).
     Gates sharing a ``seed`` therefore get independent, reproducible audit picks.
     ``seed=None`` seeds each gate's RNG from OS entropy.
+
+    Pass ``key`` (a stable id for the item, e.g. a tool call id) to make the audit
+    draw a pure function of ``(seed, gate_id, key)`` instead of the next value of
+    the gate's stream. Use it where the decision may be recomputed (no separate
+    gate node to checkpoint it). Ignored when ``seed`` is ``None``.
     """
 
     def __init__(self, policy: Policy, mode: Literal["live", "shadow"] = "live", audit_rate: float = 0.0, seed: int | None = None):
@@ -62,14 +67,19 @@ class GateDecider:
             self._rngs[gate_id] = random.Random(None if self.seed is None else f"{self.seed}:{gate_id}")
         return self._rngs[gate_id]
 
-    def __call__(self, gate_id: str, features: dict) -> dict:
+    def _draw(self, gate_id: str, key: str | None) -> float:
+        if key is None or self.seed is None:
+            return self.rng(gate_id).random()
+        return random.Random(f"{self.seed}:{gate_id}:{key}").random()  # str seed -> SHA-512, process-stable
+
+    def __call__(self, gate_id: str, features: dict, key: str | None = None) -> dict:
         ask, reason = self.policy.decide(gate_id, features)
         mode: Mode = self.mode
         will_ask = ask
         if mode == "shadow":
             will_ask = True
             reason = f"shadow (policy would {'ask' if ask else 'auto'}): {reason}"
-        elif not ask and self.audit_rate and self.rng(gate_id).random() < self.audit_rate:
+        elif not ask and self.audit_rate and self._draw(gate_id, key) < self.audit_rate:
             will_ask, mode = True, "audit"
             reason = f"audit sample: {reason}"
         return {

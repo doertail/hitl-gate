@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hitl-gate"
-version = "0.1.1"
+version = "0.2.0"
 description = "A learnable 'should I ask a human?' gate for LangGraph human-in-the-loop steps."
 readme = "README.md"
 license = "MIT"
@@ -19,8 +19,9 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+langchain = ["langchain>=1.4"]
 examples = ["matplotlib>=3.7"]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "langchain>=1.4"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

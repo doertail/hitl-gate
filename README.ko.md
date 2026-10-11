@@ -72,6 +72,50 @@ graph.invoke(Command(resume={"outcome": "approve", "review_seconds": 12.0}), con
 
 `hitl_gate.sim.run_episode(graph, inputs, reviewer, thread_id)`가 invoke / interrupt / resume 루프를 스크립트 검토자로 대신 돌려 줍니다. 테스트와 시뮬레이션에 편리합니다.
 
+## 도구 호출 승인
+
+에이전트에서 실제로 가장 흔한 HITL은 **도구 호출** 승인입니다("send_email", "issue_refund"). 위험한 도구를 `gated_tool`로 감싸면 호출마다 정책이 ask(approve / edit / reject / respond를 받는 interrupt) 또는 auto(도구를 그냥 실행)를 정합니다. 감싸지 않은 도구는 게이트되지 않습니다.
+
+```python
+from langgraph.prebuilt import ToolNode
+from hitl_gate import AlwaysAsk, DecisionLog, RulePolicy, gated_tool
+
+log = DecisionLog("tool_decisions.jsonl")
+refund = gated_tool(
+    issue_refund, policy=AlwaysAsk(), log=log,               # gate_id 기본값은 도구 이름
+    featurize=lambda name, args: {"big": args["amount"] > 50},
+)
+tools = ToolNode([lookup_order, refund])                     # 또는 create_agent(model, tools=[lookup_order, refund], checkpointer=...)
+
+# interrupt 값(LangChain HITLRequest 형식): {"action_requests": [{"name", "args", "description"}], "review_configs": [...], "hitl_gate": {...}}
+graph.invoke(Command(resume={"decisions": [{"type": "approve"}]}), config)
+#   {"type": "edit", "edited_action": {"name": "issue_refund", "args": {"amount": 20}}} | {"type": "reject", "message": "..."} | {"type": "respond", "message": "..."}
+
+refund.gate.policy = RulePolicy.fit(log.records, keys=["big"])  # 소액 환불은 auto, 고액은 계속 ask
+log.mark_downstream(tool_message.tool_call_id, "issue_refund", True)  # 나중에 문제가 된 환불
+```
+
+LangChain `create_agent`를 쓴다면 공식 미들웨어를 게이트 버전으로 바꿔 끼울 수도 있습니다. 공식 요청/응답 형식과 배치 방식을 그대로 유지하므로 기존 승인 UI(Agent Inbox 류)가 그대로 동작합니다.
+
+```python
+from hitl_gate.middleware import GatedHumanInTheLoopMiddleware   # pip install "hitl-gate[langchain]"
+
+agent = create_agent(model, tools, checkpointer=MemorySaver(), middleware=[
+    GatedHumanInTheLoopMiddleware({"issue_refund": True, "send_email": True}, policy=policy, log=log, featurize=featurize),
+])
+```
+
+| 통합 방식 | 필요 패키지 | 테스트 버전 |
+|---|---|---|
+| `ToolNode`, 직접 만든 ReAct 그래프, `create_agent(tools=...)`에서 `gated_tool(...)` | 코어만(`langgraph`, `langchain-core`가 함께 설치됨) | langgraph 1.2.14, langgraph-prebuilt 1.1.0, langchain-core 1.6.9 |
+| `create_agent`용 `GatedHumanInTheLoopMiddleware` | `hitl-gate[langchain]` (`langchain>=1.4`, `InterruptOnConfig.when`이 추가된 버전) | langchain 1.4.4 |
+
+동기와 비동기(`ainvoke`) 모두 테스트되어 있습니다. 로그의 `run_id`는 **tool call id**(`ToolMessage.tool_call_id`와 같음), `gate_id`는 도구 이름이므로 `mark_downstream(tool_call_id, tool_name, error)`로 호출 하나에 라벨을 붙입니다. 도구 호출용으로 `human_outcome`에 `"reject"`, `"respond"`가 추가됩니다. 각 decision에 `"review_seconds"`를 넣을 수 있습니다.
+
+**재개 시 결정의 일관성.** 여기에는 별도 게이트 노드가 없어서, 재개하면 LangGraph가 도구(또는 미들웨어의 `after_model`)를 처음부터 다시 실행합니다. 결정은 로그에 기록될 때까지 `(thread_id, gate_id, tool_call_id)` 단위로 메모리에 캐시되고, 감사 샘플링은 스트림의 다음 난수가 아니라 `(seed, gate_id, thread_id:tool_call_id)`의 안정적인 해시입니다(`GateDecider(..., key=...)`). 따라서 재개된 호출은 같은 결정에 도달하고 레코드를 정확히 하나만 남깁니다. `seed`를 주고 정책이 결정적이면 프로세스 재시작 뒤에도 마찬가지입니다. 테스트가 이를 검증합니다.
+
+[`examples/tool_approval`](examples/tool_approval/run.py)은 고객지원 에이전트를 오프라인으로 돌립니다(스크립트 모델, 시뮬레이션 검토자, 약 3초). 항상 묻는 대화 200건 뒤 학습한 `RulePolicy`는 50 이하 환불을 자동 승인하고(다음 200건 중 137건 중 131건, 6건은 감사), 그보다 큰 환불과 모든 이메일은 계속 사람에게 보냅니다.
+
 ## 동작 방식
 
 ```mermaid
@@ -134,7 +178,7 @@ flowchart LR
 | `decision` | **정책**의 결정: `"ask"` / `"auto"` |
 | `policy_name`, `reason` | 어떤 정책이, 왜 |
 | `mode` | `"live"`, `"shadow"`(항상 물음), `"audit"`(auto였지만 검토용으로 샘플링됨) |
-| `human_outcome` | `"approve"`, `"edit"`, `"retry"`, `"escalate"`, 아무도 묻지 않았으면 `None` |
+| `human_outcome` | `"approve"`, `"edit"`, `"retry"`, `"escalate"`(검토 게이트), `"reject"`, `"respond"`(도구 호출), 아무도 묻지 않았으면 `None` |
 | `changed` | `human_outcome != "approve"` |
 | `review_seconds` | 답에서 가져옴 |
 | `downstream_error` | 나중에 `mark_downstream`으로 채움 |
@@ -151,6 +195,10 @@ auto 통과는 gate 노드가 기록합니다. 물어본 항목은 사람이 답
 - **피처는 이산적이어야 합니다.** 버킷과 Q-table은 피처당 몇 개의 값만 다룰 수 있습니다. 연속 신호는 `featurize`에서 구간화하세요(또는 `QTablePolicy(bins=...)`). 피처가 너무 많으면 버킷당 샘플이 부족해 모든 것이 "ask"로 남는데, 이는 안전한 방향의 실패입니다.
 - **테이블 RL은 의도적으로 단순합니다.** `QTablePolicy`는 투명한 베이스라인이지 최신 학습기가 아닙니다. 예제에서는 시뮬레이션을 순수 파이썬으로 옮긴 빠른 미러에서 학습하며(고정 `alpha=0.02`), 규칙 정책을 이기지 못합니다.
 - `retry`와 `escalate`는 기록되지만 라우팅은 `review -> target`으로 고정입니다. 재시도 루프가 필요하면 `GateDecider`로 엣지를 직접 연결하세요.
+- **도구 호출: 병렬 게이트 호출은 호출마다 별도 task가 필요합니다.** `create_agent`와 `create_react_agent`는 이미 `Send`로 호출을 하나씩 보냅니다. 일반 `ToolNode`가 한 메시지에서 게이트된 호출 여러 개를 받으면 한 task 안의 스레드에서 실행되는데, interrupt는 순서로 매칭되므로 경쟁 상태가 생깁니다. `Send`나 미들웨어(배치 interrupt 하나)를 쓰세요.
+- **도구 호출: `gated_tool`은 edit로 다른 도구로 바꿀 수 없습니다**(미들웨어는 가능). 게이트된 도구는 `ToolNode`처럼 `ToolCall`로 호출해야 하며, 일반 인자로는 호출할 수 없습니다.
+- **도구 호출: 결정 캐시는 프로세스 내부에 있습니다.** 재시작 후 대기 중인 호출의 결정은 다시 계산됩니다. `seed`가 있는 결정적 정책이면 같지만, 무작위 정책이나 그 사이 교체된 정책이면 다를 수 있습니다. interrupt된 뒤 재개되지 않은 호출은 캐시에 남습니다. 스스로 `interrupt()`를 호출하는 도구는 두 번 기록됩니다.
+- **로그는 메모리 또는 로컬 JSONL 파일입니다.** DB 백엔드나 프로세스 간 잠금은 없으며, 여러 워커가 한 파일에 쓰는 것은 지원하지 않습니다.
 
 ## 관련 연구
 
@@ -160,10 +208,11 @@ auto 통과는 gate 노드가 기록합니다. 물어본 항목은 사람이 답
 ## 개발
 
 ```bash
-python3 -m venv .venv            # Python 3.14, langgraph 1.2에서 테스트됨
+python3 -m venv .venv            # Python 3.14, langgraph 1.2.14, langchain 1.4.4에서 테스트됨
 .venv/bin/pip install -e ".[dev,examples]"
 .venv/bin/pytest -q
 .venv/bin/python examples/document_pipeline/run.py   # 약 25초, docs/tradeoff.png 생성
+.venv/bin/python examples/tool_approval/run.py       # 약 3초, 도구 호출 승인
 ```
 
 예제는 시드가 고정되어 있어 재현 가능합니다. 버전별 변경 사항은 [CHANGELOG.md](CHANGELOG.md) 참조.
