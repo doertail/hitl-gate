@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0
+
+- **`LogisticPolicy`.** Per-item error probability (pure-Python logistic regression over all features, numbers standardised, others one-hot, per-gate intercept) plus a cost threshold: ask when `p(miss) > review_cost / miss_cost` (float or per-gate dict). One model can be pooled across gates; unseen gates or gates under `min_gate_samples` are asked. `proba()`, JSON `save()`/`load()`. Same miss label as `RulePolicy` (changed, or failed downstream).
+- `RulePolicy.fit` and `LogisticPolicy.fit` share the miss-label helper; behaviour unchanged.
+- `examples/document_pipeline` evaluates `LogisticPolicy`: 0.83 reviews/run, 3.0 missed per 100 runs, cost 1.58 (rule: 1.29, 2.2, 1.84).
+
 ## 0.2.0
 
 - **Tool-call approval.** New `gated_tool(tool, *, policy, log, gate_id=None, featurize=lambda name, args: {}, mode="live", audit_rate=0.0, seed=None, allowed_decisions=..., edit_notice=...)` wraps any LangChain tool so each call is gated: auto runs it, ask interrupts with a LangChain `HITLRequest`-shaped payload and accepts `{"decisions": [approve | edit | reject | respond]}`. Works in `ToolNode`, hand-built graphs and `create_agent`, with only `langgraph` installed. Sync and async.

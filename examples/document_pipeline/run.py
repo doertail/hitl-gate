@@ -28,7 +28,7 @@ from typing import Annotated, TypedDict
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from hitl_gate import AlwaysAsk, DecisionLog, NeverAsk, QTablePolicy, RulePolicy, add_gated_review, merge_dicts
+from hitl_gate import AlwaysAsk, DecisionLog, LogisticPolicy, NeverAsk, QTablePolicy, RulePolicy, add_gated_review, merge_dicts
 from hitl_gate.sim import run_episode
 
 STEPS = ["extract", "classify", "compose"]
@@ -169,13 +169,13 @@ def plot(rows: list[dict], path: Path) -> None:
     import matplotlib.pyplot as plt
 
     surface, ink, ink2, grid = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
-    color = {"AlwaysAsk": ink2, "NeverAsk": ink2, "RulePolicy": "#2a78d6", "RulePolicy + 5% audit": "#2a78d6", "QTablePolicy": "#eb6834"}
+    color = {"AlwaysAsk": ink2, "NeverAsk": ink2, "RulePolicy": "#2a78d6", "RulePolicy + 5% audit": "#2a78d6", "QTablePolicy": "#eb6834", "LogisticPolicy": "#1b9e77"}
     fig, ax = plt.subplots(figsize=(7.5, 4.6), dpi=160)
     fig.patch.set_facecolor(surface)
     ax.set_facecolor(surface)
     # label offsets (points) and alignment, hand-placed to avoid collisions
     place = {"AlwaysAsk": (-10, 8, "right"), "NeverAsk": (10, -6, "left"), "RulePolicy": (-6, -12, "right"),
-             "RulePolicy + 5% audit": (10, -12, "left"), "QTablePolicy": (-8, 10, "right")}
+             "RulePolicy + 5% audit": (10, -12, "left"), "QTablePolicy": (8, 12, "left"), "LogisticPolicy": (-10, -14, "right")}
     for r in rows:
         hollow = "audit" in r["name"]
         y = r["missed"] * 100
@@ -215,6 +215,9 @@ def main(n_collect: int = 500, n_eval: int = 1000, q_episodes: int = 60_000) -> 
     print("\nfitted RulePolicy (min_count=30, max_change_rate=2%):")
     print(rule.describe())
 
+    logit = LogisticPolicy.fit(collected.records, threshold=REVIEW_COST / MISS_COST)
+    print(f"fitted LogisticPolicy (threshold = review/miss cost = {REVIEW_COST / MISS_COST:.0%})")
+
     print(f"\nphase 2: training QTablePolicy on {q_episodes} mirror episodes...")
     qpol = train_qtable(q_episodes, seed=1)
 
@@ -224,6 +227,7 @@ def main(n_collect: int = 500, n_eval: int = 1000, q_episodes: int = 60_000) -> 
         evaluate("AlwaysAsk", AlwaysAsk(), held_out),
         evaluate("RulePolicy", rule, held_out),
         evaluate("RulePolicy + 5% audit", rule, held_out, audit_rate=0.05),
+        evaluate("LogisticPolicy", logit, held_out),
         evaluate("QTablePolicy", qpol, held_out),
         evaluate("NeverAsk", NeverAsk(), held_out),
     ]

@@ -12,6 +12,7 @@
 
 - **AlwaysAsk**는 실행당 3.00건을 사람에게 보내고, 100회 실행당 0.9건의 오류를 통과시킵니다.
 - 로그 500회로 학습한 **RulePolicy**는 실행당 1.29회만 묻고(**검토 57% 감소**) 100회당 2.2건의 오류를 통과시키며, 총비용은 실행당 3.23에서 1.84로 줄어듭니다.
+- 같은 로그로 학습한 **LogisticPolicy**(건별 오류 확률이 `검토 비용 / 놓침 비용` = 4%를 넘으면 묻기)는 실행당 0.83회만 묻고(**검토 72% 감소**) 100회당 3.0건을 통과시키며, 총비용이 가장 낮습니다: 실행당 1.84 → **1.58**.
 - **NeverAsk**는 100회당 13.9건의 오류를 통과시킵니다. 검토를 아예 없애는 건 답이 아닙니다.
 
 ## 왜 필요한가
@@ -126,7 +127,7 @@ flowchart LR
     G -. 기록 .-> L[(DecisionLog)]
     R -. 기록 + 결과 .-> L
     T -. 다운스트림 오류 .-> L
-    L -- RulePolicy.fit / Q-learning --> P[더 나은 정책] --> G
+    L -- RulePolicy / LogisticPolicy.fit, Q-learning --> P[더 나은 정책] --> G
 ```
 
 `add_gated_review`는 `source`와 `target` 사이에 노드 두 개를 넣습니다.
@@ -147,6 +148,7 @@ flowchart LR
 | `AlwaysAsk` | 항상 (현재의 기본값) | — |
 | `NeverAsk` | 절대 안 물음 (베이스라인 전용) | — |
 | `RulePolicy.fit(records, keys, min_count=30, max_change_rate=0.02)` | 버킷 `(gate_id, 피처 값)`의 검토 샘플이 `min_count` 미만이거나 **또는** miss 비율이 `max_change_rate`를 넘을 때. 모르는 버킷 → ask. `describe()`가 규칙을 출력. | 기록된 검토 |
+| `LogisticPolicy.fit(records, threshold, min_gate_samples=0)` | `p(miss) > threshold`일 때. `p`는 항목의 모든 피처(숫자는 표준화, 나머지는 원-핫)와 게이트별 절편으로 만든 로지스틱 회귀이고, `threshold = 검토 비용 / 놓침 비용`(float 또는 게이트별 dict)으로 둡니다. 모델 하나를 **여러 게이트가 함께 학습**할 수 있어, 건수가 적은 게이트도 다른 게이트가 배운 것을 빌려 씁니다. 처음 보는 게이트나 `min_gate_samples` 미만 → ask. `proba()`, JSON `save()`/`load()`. 순수 파이썬, 추가 의존성 없음. | 기록된 검토 (`RulePolicy`와 같은 놓침 라벨) |
 | `QTablePolicy` | `(gate_id, 이산화된 피처)`에서 `Q(ask) >= Q(auto)`일 때. 동점과 처음 보는 상태 → ask. 학습용 epsilon-greedy `act()`, `learn_episode()`, JSON `save()`/`load()`. | 직접 정의한 보상 (예: `-review_cost`, `-error_cost`) |
 
 `RulePolicy` 버킷은 `keys` 중 그 게이트의 피처에 실제로 있는 키만 씁니다. 그래서 피처가 서로 다른 게이트들이 `keys` 목록 하나를 같이 써도 되고, `describe()`는 게이트마다 자기 조건만 보여 줍니다.
@@ -192,7 +194,7 @@ auto 통과는 gate 노드가 기록합니다. 물어본 항목은 사람이 답
 
 - **시뮬레이션 결과는 가정에 좌우됩니다.** 그래프는 임의로 정한 오류율, 적발률(90%), 비용(검토 1회 = 1, 놓친 오류 1건 = 25)을 쓰는 장난감 파이프라인에서 나왔습니다. 여러분의 수치는 다를 것입니다. 먼저 실제 트래픽에서 shadow 모드로 돌려 보세요.
 - **법적·계약상 필수인 승인은 절대 게이트하지 마세요.** 사람이 반드시 서명해야 한다면 `interrupt()`를 무조건 유지하세요.
-- **피처는 이산적이어야 합니다.** 버킷과 Q-table은 피처당 몇 개의 값만 다룰 수 있습니다. 연속 신호는 `featurize`에서 구간화하세요(또는 `QTablePolicy(bins=...)`). 피처가 너무 많으면 버킷당 샘플이 부족해 모든 것이 "ask"로 남는데, 이는 안전한 방향의 실패입니다.
+- **버킷과 Q-table은 피처가 이산적이어야 합니다**(`LogisticPolicy`는 숫자 피처를 그대로 받습니다). 버킷과 Q-table은 피처당 몇 개의 값만 다룰 수 있습니다. 연속 신호는 `featurize`에서 구간화하세요(또는 `QTablePolicy(bins=...)`). 피처가 너무 많으면 버킷당 샘플이 부족해 모든 것이 "ask"로 남는데, 이는 안전한 방향의 실패입니다.
 - **테이블 RL은 의도적으로 단순합니다.** `QTablePolicy`는 투명한 베이스라인이지 최신 학습기가 아닙니다. 예제에서는 시뮬레이션을 순수 파이썬으로 옮긴 빠른 미러에서 학습하며(고정 `alpha=0.02`), 규칙 정책을 이기지 못합니다.
 - `retry`와 `escalate`는 기록되지만 라우팅은 `review -> target`으로 고정입니다. 재시도 루프가 필요하면 `GateDecider`로 엣지를 직접 연결하세요.
 - **도구 호출: 병렬 게이트 호출은 호출마다 별도 task가 필요합니다.** `create_agent`와 `create_react_agent`는 이미 `Send`로 호출을 하나씩 보냅니다. 일반 `ToolNode`가 한 메시지에서 게이트된 호출 여러 개를 받으면 한 task 안의 스레드에서 실행되는데, interrupt는 순서로 매칭되므로 경쟁 상태가 생깁니다. `Send`나 미들웨어(배치 interrupt 하나)를 쓰세요.

@@ -12,6 +12,7 @@ In the bundled simulated document pipeline ([`examples/document_pipeline`](examp
 
 - **AlwaysAsk** sends 3.00 items per run to a human and lets 0.9 errors per 100 runs through.
 - A **RulePolicy** fitted from 500 logged runs asks 1.29 times per run (**57% fewer reviews**) at 2.2 errors per 100 runs, cutting total cost from 3.23 to 1.84 per run.
+- A **LogisticPolicy** (per-item error probability, asks when it exceeds `review_cost / miss_cost` = 4%) fitted on the same logs asks 0.83 times per run (**72% fewer reviews**) at 3.0 errors per 100 runs, the lowest total cost: 1.84 → **1.58** per run.
 - **NeverAsk** lets 13.9 errors per 100 runs through. Removing review entirely is not the answer.
 
 ## Why
@@ -126,7 +127,7 @@ flowchart LR
     G -. record .-> L[(DecisionLog)]
     R -. record + outcome .-> L
     T -. downstream errors .-> L
-    L -- RulePolicy.fit / Q-learning --> P[better policy] --> G
+    L -- RulePolicy / LogisticPolicy.fit, Q-learning --> P[better policy] --> G
 ```
 
 `add_gated_review` inserts two nodes between `source` and `target`:
@@ -147,6 +148,7 @@ If you wire graphs yourself, use `GateDecider(policy, mode, audit_rate, seed)` d
 | `AlwaysAsk` | always (today's default) | — |
 | `NeverAsk` | never (baseline only) | — |
 | `RulePolicy.fit(records, keys, min_count=30, max_change_rate=0.02)` | the bucket `(gate_id, feature values)` has fewer than `min_count` reviewed samples **or** a miss rate above `max_change_rate`. Unknown buckets → ask. `describe()` prints the rules. | logged reviews |
+| `LogisticPolicy.fit(records, threshold, min_gate_samples=0)` | `p(miss) > threshold`. `p` is a logistic regression over all of the item's features (numbers standardised, everything else one-hot) plus a per-gate intercept; set `threshold = review_cost / miss_cost` (float, or dict per gate). One model can be **pooled across gates**, so a low-volume gate borrows what high-volume gates learned. Unseen gates, or gates under `min_gate_samples` → ask. `proba()`, `save()`/`load()` JSON. Pure Python, no extra dependency. | logged reviews (same miss label as `RulePolicy`) |
 | `QTablePolicy` | `Q(ask) >= Q(auto)` for `(gate_id, discretized features)`. Ties and unseen states → ask. `act()` for epsilon-greedy training, `learn_episode()`, `save()`/`load()` JSON. | your reward signal (e.g. `-review_cost`, `-error_cost`) |
 
 `RulePolicy` buckets only use the `keys` a gate's features actually contain, so one `keys` list can span gates with different features, and `describe()` shows each gate's own conditions.
@@ -192,7 +194,7 @@ Auto passes are logged by the gate node. Asked items are logged once the human a
 
 - **Simulated results depend on their assumptions.** The plot comes from a toy pipeline with made-up error rates, catch rate (90%) and costs (1 review = 1, 1 missed error = 25). Your numbers will differ. Run shadow mode on your own traffic first.
 - **Never gate legally or contractually required approvals.** If a human must sign off, keep `interrupt()` unconditional.
-- **Features must be discrete.** Buckets and Q-tables need a handful of values per feature. Bucket continuous signals in `featurize` (or use `QTablePolicy(bins=...)`). Too many features means too few samples per bucket, so everything stays "ask", which is the safe failure mode.
+- **Features must be discrete for buckets and Q-tables** (`LogisticPolicy` takes numeric features as they are). Buckets and Q-tables need a handful of values per feature. Bucket continuous signals in `featurize` (or use `QTablePolicy(bins=...)`). Too many features means too few samples per bucket, so everything stays "ask", which is the safe failure mode.
 - **Tabular RL is simple by design.** `QTablePolicy` is a transparent baseline, not a state-of-the-art learner. In the example it trains on a fast pure-Python mirror of the simulation (fixed `alpha=0.02`) and does not beat the rule policy.
 - `retry` and `escalate` are logged, but routing stays `review -> target`. For retry loops, wire your own edges using `GateDecider`.
 - **Tool calls: parallel gated calls need one task per call.** `create_agent` and `create_react_agent` already dispatch each call with `Send`. A plain `ToolNode` that receives several gated calls in one message runs them in threads inside one task, where interrupts are matched by order, which is racy. Use `Send`, or the middleware (one batched interrupt).

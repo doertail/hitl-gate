@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 import random
 from collections import defaultdict
 from pathlib import Path
@@ -37,6 +38,19 @@ class NeverAsk:
 
     def decide(self, gate_id: str, features: dict) -> tuple[bool, str]:
         return False, "never ask"
+
+
+def _miss_label(r: DecisionRecord, count_downstream_errors: bool = True) -> bool | None:
+    """Training label shared by the fitted policies; ``None`` = not evidence either way.
+
+    A *miss* is a reviewed record the human changed, or — with ``count_downstream_errors`` —
+    any record (reviewed or auto-passed) that later failed downstream (rubber-stamp protection).
+    An un-reviewed auto pass with no downstream error is not evidence of correctness.
+    """
+    downstream = count_downstream_errors and bool(r.downstream_error)
+    if r.asked:
+        return bool(r.changed) or downstream
+    return True if downstream else None
 
 
 def _bucket(gate_id: str, features: dict, keys: Iterable[str]) -> tuple:
@@ -84,13 +98,9 @@ class RulePolicy:
             keys = sorted({k for r in records for k in r.features})
         stats: dict = defaultdict(lambda: [0, 0])
         for r in records:
-            downstream = count_downstream_errors and bool(r.downstream_error)
-            if r.asked:
-                miss = bool(r.changed) or downstream
-            elif downstream:
-                miss = True
-            else:
-                continue  # an un-reviewed auto pass is not evidence of correctness
+            miss = _miss_label(r, count_downstream_errors)
+            if miss is None:
+                continue
             s = stats[_bucket(r.gate_id, r.features, keys)]
             s[0] += 1
             s[1] += miss
@@ -217,3 +227,113 @@ class QTablePolicy:
         p.q = data["q"]
         p.n = data.get("n", {})  # files from 0.1.0 have no counts
         return p
+
+
+def _encode(gate_id: str, features: dict) -> dict:
+    """Sparse feature map: numbers stay numeric, everything else one-hot; plus a per-gate intercept."""
+    x = {"__gate__=" + gate_id: 1.0}
+    for k, v in features.items():
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            x[f"{k}={v!r}"] = 1.0
+        else:
+            x[k] = float(v)
+    return x
+
+
+def _sigmoid(z: float) -> float:
+    if z >= 0:
+        return 1.0 / (1.0 + math.exp(-z))
+    e = math.exp(z)
+    return e / (1.0 + e)
+
+
+class LogisticPolicy:
+    """Per-item error probability (logistic regression) + a cost threshold.
+
+    Asks when ``p(miss) * miss_cost > review_cost``, i.e. ``p > threshold`` with
+    ``threshold = review_cost / miss_cost`` (a float, or a dict per gate_id).
+    Unlike :class:`RulePolicy`, it scores each item from all its features, so items in the same
+    bucket can be treated differently, and one model can be **pooled across gates**: shared
+    feature weights are learned from every gate, and each gate keeps its own intercept. A gate
+    with too few labelled samples (``min_gate_samples``) or never seen is always asked.
+
+    Pure Python (batch gradient descent, L2). Numeric features are standardised; non-numeric
+    and bool features are one-hot. Fine for the tens-of-thousands-of-records scale of review logs.
+    """
+
+    name = "logistic"
+
+    def __init__(self, weights: dict, scale: dict, threshold: float | dict, gate_counts: dict, min_gate_samples: int):
+        self.weights = weights  # feature -> weight, "__bias__" -> intercept
+        self.scale = scale  # numeric feature -> [mean, std]
+        self.threshold = threshold
+        self.gate_counts = gate_counts  # gate_id -> labelled samples seen in fit
+        self.min_gate_samples = min_gate_samples
+
+    @classmethod
+    def fit(
+        cls,
+        records: Iterable[DecisionRecord],
+        threshold: float | dict,
+        min_gate_samples: int = 0,
+        l2: float = 1e-3,
+        epochs: int = 300,
+        lr: float = 0.5,
+        count_downstream_errors: bool = True,
+    ) -> "LogisticPolicy":
+        """Fit from logged decisions, with the same miss label as :meth:`RulePolicy.fit`."""
+        X, y, counts = [], [], defaultdict(int)
+        for r in records:
+            miss = _miss_label(r, count_downstream_errors)
+            if miss is None:
+                continue
+            X.append(_encode(r.gate_id, r.features))
+            y.append(1.0 if miss else 0.0)
+            counts[r.gate_id] += 1
+        numeric = {k for x in X for k in x if "=" not in k}
+        scale = {}
+        for k in numeric:
+            vals = [x.get(k, 0.0) for x in X]
+            m = sum(vals) / len(vals)
+            sd = (sum((v - m) ** 2 for v in vals) / len(vals)) ** 0.5 or 1.0
+            scale[k] = [m, sd]
+        X = [{k: (v - scale[k][0]) / scale[k][1] if k in scale else v for k, v in x.items()} for x in X]
+        w: dict = defaultdict(float)
+        n = len(X) or 1
+        for _ in range(epochs):  # ponytail: full-batch GD in pure Python; swap in sklearn if logs reach millions
+            grad: dict = defaultdict(float)
+            for x, t in zip(X, y):
+                err = _sigmoid(w["__bias__"] + sum(w[k] * v for k, v in x.items())) - t
+                grad["__bias__"] += err
+                for k, v in x.items():
+                    grad[k] += err * v
+            for k, g in grad.items():
+                w[k] -= lr * (g / n + (l2 * w[k] if k != "__bias__" else 0.0))
+        return cls(dict(w), scale, threshold, dict(counts), min_gate_samples)
+
+    def proba(self, gate_id: str, features: dict) -> float:
+        x = _encode(gate_id, features)
+        z = self.weights.get("__bias__", 0.0)
+        for k, v in x.items():
+            if k in self.scale:
+                v = (v - self.scale[k][0]) / self.scale[k][1]
+            z += self.weights.get(k, 0.0) * v
+        return _sigmoid(z)
+
+    def decide(self, gate_id: str, features: dict) -> tuple[bool, str]:
+        n = self.gate_counts.get(gate_id, 0)
+        if n == 0 or n < self.min_gate_samples:
+            return True, f"insufficient evidence for gate (n={n})"
+        th = self.threshold[gate_id] if isinstance(self.threshold, dict) else self.threshold
+        p = self.proba(gate_id, features)
+        return (p > th), f"p(miss) {p:.2%} {'>' if p > th else '<='} threshold {th:.2%}"
+
+    def save(self, path: str | Path) -> None:
+        data = {"weights": self.weights, "scale": self.scale, "threshold": self.threshold,
+                "gate_counts": self.gate_counts, "min_gate_samples": self.min_gate_samples}
+        Path(path).write_text(json.dumps(data, indent=1), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: str | Path) -> "LogisticPolicy":
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls(d["weights"], d["scale"], d["threshold"], d["gate_counts"], d["min_gate_samples"])
