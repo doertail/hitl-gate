@@ -26,7 +26,7 @@
 ## 30초 퀵스타트
 
 ```bash
-pip install git+<this-repo-url>   # 아직 PyPI에 없음. 또는 clone 후 `pip install -e .`
+pip install git+https://github.com/doertail/hitl-gate   # 아직 PyPI에 없음. 또는 clone 후 `pip install -e .`
 ```
 
 ```python

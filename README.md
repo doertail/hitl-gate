@@ -26,7 +26,7 @@ Most agent graphs put `interrupt()` at every review point. That is safe on day o
 ## 30-second quickstart
 
 ```bash
-pip install git+<this-repo-url>   # not on PyPI yet; or clone and `pip install -e .`
+pip install git+https://github.com/doertail/hitl-gate   # not on PyPI yet
 ```
 
 ```python
