@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1
+
+- `LogisticPolicy.fit(min_gate_samples=...)` now defaults to **30** (was 0): a gate with fewer than 30 labelled records keeps asking instead of being auto-passed on pooled weights. Pass `min_gate_samples=0` to restore the old behaviour.
+- README: pool only gates of the same kind of work; the logistic example now states that it lets more errors through than the rule (2.2 → 3.0 per 100 runs).
+
 ## 0.3.0
 
 - **`LogisticPolicy`.** Per-item error probability (pure-Python logistic regression over all features, numbers standardised, others one-hot, per-gate intercept) plus a cost threshold: ask when `p(miss) > review_cost / miss_cost` (float or per-gate dict). One model can be pooled across gates; unseen gates or gates under `min_gate_samples` are asked. `proba()`, JSON `save()`/`load()`. Same miss label as `RulePolicy` (changed, or failed downstream).

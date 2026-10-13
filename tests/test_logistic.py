@@ -32,10 +32,10 @@ def test_scores_items_inside_one_bucket():
 
 def test_pooled_gate_with_few_records_borrows_shared_weights():
     logs = _logs("big", 2000, 1) + _logs("small", 15, 2)
-    pol = LogisticPolicy.fit(logs, threshold=0.05)
+    pol = LogisticPolicy.fit(logs, threshold=0.05, min_gate_samples=0)  # opt in to pooling a 15-record gate
     assert not pol.decide("small", {"product": "A", "unmapped": 0})[0]
     assert pol.decide("small", {"product": "A", "unmapped": 3})[0]
-    strict = LogisticPolicy.fit(logs, threshold=0.05, min_gate_samples=50)
+    strict = LogisticPolicy.fit(logs, threshold=0.05)  # default 30: a 15-record gate keeps asking
     assert strict.decide("small", {"product": "A", "unmapped": 0})[0]
 
 

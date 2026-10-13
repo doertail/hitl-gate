@@ -275,7 +275,7 @@ class LogisticPolicy:
         cls,
         records: Iterable[DecisionRecord],
         threshold: float | dict,
-        min_gate_samples: int = 0,
+        min_gate_samples: int = 30,
         l2: float = 1e-3,
         epochs: int = 300,
         lr: float = 0.5,

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hitl-gate"
-version = "0.3.0"
+version = "0.3.1"
 description = "A learnable 'should I ask a human?' gate for LangGraph human-in-the-loop steps."
 readme = "README.md"
 license = "MIT"

@@ -12,7 +12,7 @@ In the bundled simulated document pipeline ([`examples/document_pipeline`](examp
 
 - **AlwaysAsk** sends 3.00 items per run to a human and lets 0.9 errors per 100 runs through.
 - A **RulePolicy** fitted from 500 logged runs asks 1.29 times per run (**57% fewer reviews**) at 2.2 errors per 100 runs, cutting total cost from 3.23 to 1.84 per run.
-- A **LogisticPolicy** (per-item error probability, asks when it exceeds `review_cost / miss_cost` = 4%) fitted on the same logs asks 0.83 times per run (**72% fewer reviews**) at 3.0 errors per 100 runs, the lowest total cost: 1.84 → **1.58** per run.
+- A **LogisticPolicy** (per-item error probability, asks when it exceeds `review_cost / miss_cost` = 4%) fitted on the same logs asks 0.83 times per run (**72% fewer reviews**) at 3.0 errors per 100 runs, the lowest total cost: 1.84 → **1.58** per run, but it lets more errors through than the rule (2.2 → 3.0 per 100 runs). Whether that trade is worth it depends on your miss cost.
 - **NeverAsk** lets 13.9 errors per 100 runs through. Removing review entirely is not the answer.
 
 ## Why
@@ -148,7 +148,7 @@ If you wire graphs yourself, use `GateDecider(policy, mode, audit_rate, seed)` d
 | `AlwaysAsk` | always (today's default) | — |
 | `NeverAsk` | never (baseline only) | — |
 | `RulePolicy.fit(records, keys, min_count=30, max_change_rate=0.02)` | the bucket `(gate_id, feature values)` has fewer than `min_count` reviewed samples **or** a miss rate above `max_change_rate`. Unknown buckets → ask. `describe()` prints the rules. | logged reviews |
-| `LogisticPolicy.fit(records, threshold, min_gate_samples=0)` | `p(miss) > threshold`. `p` is a logistic regression over all of the item's features (numbers standardised, everything else one-hot) plus a per-gate intercept; set `threshold = review_cost / miss_cost` (float, or dict per gate). One model can be **pooled across gates**, so a low-volume gate borrows what high-volume gates learned. Unseen gates, or gates under `min_gate_samples` → ask. `proba()`, `save()`/`load()` JSON. Pure Python, no extra dependency. | logged reviews (same miss label as `RulePolicy`) |
+| `LogisticPolicy.fit(records, threshold, min_gate_samples=30)` | `p(miss) > threshold`. `p` is a logistic regression over all of the item's features (numbers standardised, everything else one-hot) plus a per-gate intercept; set `threshold = review_cost / miss_cost` (float, or dict per gate). One model can be pooled across gates, but **only pool gates of the same kind of work** (same business area, same reviewers): a signal can mean different things in different areas, and mixed pools auto-pass items that a gate-level model would ask about. Unseen gates, or gates with fewer than `min_gate_samples` labelled records (default 30) → ask, so a low-volume gate keeps asking until its own records accumulate. `proba()`, `save()`/`load()` JSON. Pure Python, no extra dependency. | logged reviews (same miss label as `RulePolicy`) |
 | `QTablePolicy` | `Q(ask) >= Q(auto)` for `(gate_id, discretized features)`. Ties and unseen states → ask. `act()` for epsilon-greedy training, `learn_episode()`, `save()`/`load()` JSON. | your reward signal (e.g. `-review_cost`, `-error_cost`) |
 
 `RulePolicy` buckets only use the `keys` a gate's features actually contain, so one `keys` list can span gates with different features, and `describe()` shows each gate's own conditions.
